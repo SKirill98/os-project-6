@@ -1,0 +1,4 @@
+oss
+worker
+*.o
+*.out
