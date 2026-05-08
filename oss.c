@@ -1,13 +1,13 @@
 /*
- * oss.c - Operating System Simulator with FIFO page replacement
- * Author: kslab
- * Date:   2026-05-04
- *
- * Manages a 64-frame physical memory (64K / 1K page size).
- * Each of up to 20 worker processes has a 16-entry page table.
- * Page faults are resolved with FIFO replacement; dirty evictions
- * add an extra 14 ms of simulated I/O time.
- */
+Operating System Simulator with FIFO page replacement
+Author: Kirill Slabun
+Date:   2026-05-04
+
+Manages a 64-frame physical memory (64K / 1K page size).
+Each of up to 20 worker processes has a 16-entry page table.
+Page faults are resolved with FIFO replacement; dirty evictions
+add an extra 14 ms of simulated I/O time.
+*/
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,34 +25,32 @@
 #include <sys/msg.h>
 #include "shared.h"
 
-/* -- IPC handles (global for signal cleanup) --------------------------- */
+// Global variables
 static int    shm_id;
 static int   *clockptr = NULL;
 static int    msqid;
 static FILE  *log_file = NULL;
 
-/* -- System tables ----------------------------------------------------- */
+// System Tables
 static FrameEntry  frame_table[NUM_FRAMES];
 static struct PCB  table[MAX_PCB];
 
 /*
- * FIFO queue for page replacement.
- * Each entry is the frame index of a page that was loaded.
- * Stale entries (freed frames) are skipped during eviction.
- */
+FIFO queue for page replacement.
+Each entry is the frame index of a page that was loaded.
+Stale entries (freed frames) are skipped during eviction.
+*/
 #define FIFO_CAP (NUM_FRAMES * 200)
 static int fifo_queue[FIFO_CAP];
 static int fifo_head = 0;   /* index of oldest entry  */
 static int fifo_tail = 0;   /* index of next free slot */
 
-/* -- Statistics -------------------------------------------------------- */
+// Statistics
 static int total_reads       = 0;
 static int total_writes      = 0;
 static int total_page_faults = 0;
 
-/* -----------------------------------------------------------------------
- * Utility helpers
- * ----------------------------------------------------------------------- */
+// Utility helpers
 
 static void cleanup(int sig) {
     if (sig != 0) {
@@ -81,17 +79,15 @@ static void log_msg(const char *fmt, ...) {
     }
 }
 
-/* Add delta_ns nanoseconds to the shared simulated clock */
+// Add delta_ns nanoseconds to the shared simulated clock
 static void advance_clock(int *sec, int *nano, int delta_ns) {
     *nano += delta_ns;
     while (*nano >= BILLION) { (*sec)++; *nano -= BILLION; }
 }
 
-/* -----------------------------------------------------------------------
- * Frame / page-table management
- * ----------------------------------------------------------------------- */
+// Frame / page-table management
 
-/* Returns a free frame index, or -1 if all frames are occupied */
+// Returns a free frame index, or -1 if all frames are occupied
 static int find_free_frame(void) {
     for (int i = 0; i < NUM_FRAMES; i++)
         if (!frame_table[i].occupied) return i;
@@ -99,26 +95,26 @@ static int find_free_frame(void) {
 }
 
 /*
- * FIFO eviction: dequeue from the head, skipping any frames that have
- * since been freed (process terminated before they were evicted).
- * Falls back to a linear scan if the queue is exhausted somehow.
- */
+FIFO eviction: dequeue from the head, skipping any frames that have
+since been freed (process terminated before they were evicted).
+Falls back to a linear scan if the queue is exhausted somehow.
+*/
 static int fifo_evict(void) {
     while (fifo_head != fifo_tail) {
         int frame = fifo_queue[fifo_head % FIFO_CAP];
         fifo_head++;
         if (frame_table[frame].occupied) return frame;
     }
-    /* Fallback: should not normally be reached */
+    // Fallback: should not normally be reached
     for (int i = 0; i < NUM_FRAMES; i++)
         if (frame_table[i].occupied) return i;
     return -1;
 }
 
 /*
- * Load process pcb_idx's logical page into physical frame.
- * Caller is responsible for clearing the old occupant first.
- */
+Load process pcb_idx's logical page into physical frame.
+Caller is responsible for clearing the old occupant first.
+*/
 static void load_page(int frame, int pcb_idx, int page) {
     frame_table[frame].occupied = 1;
     frame_table[frame].dirty    = 0;
@@ -126,12 +122,12 @@ static void load_page(int frame, int pcb_idx, int page) {
     frame_table[frame].page     = page;
     table[pcb_idx].page_table[page] = frame;
 
-    /* Record in FIFO */
+    // Record in FIFO
     fifo_queue[fifo_tail % FIFO_CAP] = frame;
     fifo_tail++;
 }
 
-/* Release all frames owned by pcb_idx when the process terminates */
+// Release all frames owned by pcb_idx when the process terminates
 static void free_process_frames(int pcb_idx) {
     for (int i = 0; i < NUM_FRAMES; i++) {
         if (frame_table[i].occupied && frame_table[i].process == pcb_idx) {
@@ -145,9 +141,25 @@ static void free_process_frames(int pcb_idx) {
         table[pcb_idx].page_table[p] = -1;
 }
 
-/* -----------------------------------------------------------------------
- * Output helpers
- * ----------------------------------------------------------------------- */
+// Output helpers
+
+static void print_pcb_table(void) {
+    log_msg("OSS: PCB Table:\n");
+    log_msg("%-5s %-10s %-8s %-12s %-12s %-12s %-12s %-8s\n",
+            "Entry", "Occupied", "PID", "StartS", "StartNano", "EndS", "EndNano", "Blocked");
+    for (int i = 0; i < MAX_PCB; i++) {
+        log_msg("%-5d %-10d %-8d %-12d %-12d %-12d %-12d %-8d\n",
+                i,
+                table[i].occupied,
+                table[i].pid,
+                table[i].start_sec,
+                table[i].start_nanosec,
+                table[i].end_sec,
+                table[i].end_nano,
+                table[i].blocked);
+    }
+    log_msg("\n");
+}
 
 static void print_memory_map(int sec, int nano) {
     log_msg("\nOSS: Current memory layout at time %d:%09d\n", sec, nano);
@@ -172,19 +184,20 @@ static void print_memory_map(int sec, int nano) {
     log_msg("\n");
 }
 
-/* -----------------------------------------------------------------------
- * Memory request handler
- * Returns 1 on page fault (process blocked), 0 on page hit (grant sent).
- * ----------------------------------------------------------------------- */
+/*
+Memory request handler
+Returns 1 on page fault (process blocked), 0 on page hit (grant sent).
+*/
 static int handle_memory_request(int pcb_idx, int address, int is_write,
                                  int *sec, int *nano) {
     int page  = address / PAGE_SIZE;
     int frame = table[pcb_idx].page_table[page];
 
     if (is_write) total_writes++; else total_reads++;
+    table[pcb_idx].total_accesses++;
 
     if (frame != -1) {
-        /* -- Page hit ----------------------------------------------- */
+        // Page hit
         if (is_write) {
             frame_table[frame].dirty = 1;
             log_msg("OSS: Address %d in frame %d, writing data to frame at time %d:%09d\n",
@@ -199,7 +212,7 @@ static int handle_memory_request(int pcb_idx, int address, int is_write,
         return 0;
     }
 
-    /* -- Page fault ------------------------------------------------- */
+    // Page fault
     total_page_faults++;
     log_msg("OSS: Address %d is not in a frame, pagefault for P%d page %d at time %d:%09d\n",
             address, pcb_idx, page, *sec, *nano);
@@ -208,7 +221,7 @@ static int handle_memory_request(int pcb_idx, int address, int is_write,
     int target_frame = find_free_frame();
 
     if (target_frame == -1) {
-        /* FIFO: evict the oldest occupied frame */
+        // FIFO: evict the oldest occupied frame
         target_frame = fifo_evict();
         int old_proc = frame_table[target_frame].process;
         int old_page = frame_table[target_frame].page;
@@ -219,14 +232,14 @@ static int handle_memory_request(int pcb_idx, int address, int is_write,
         if (frame_table[target_frame].dirty) {
             log_msg("OSS: Dirty bit of frame %d set, adding additional time to the clock\n",
                     target_frame);
-            extra_ns = DISK_IO_NS; /* extra write-back cost */
+            extra_ns = DISK_IO_NS; // extra write-back cost
         }
 
-        /* Invalidate the evicted page in its owner's page table */
+        // Invalidate the evicted page in its owner's page table
         if (old_proc >= 0 && table[old_proc].occupied)
             table[old_proc].page_table[old_page] = -1;
 
-        /* Clear the frame before reuse */
+        // Clear the frame before reuse
         frame_table[target_frame].occupied = 0;
     } else {
         log_msg("OSS: Swapping in P%d page %d into free frame %d\n",
@@ -236,7 +249,7 @@ static int handle_memory_request(int pcb_idx, int address, int is_write,
     load_page(target_frame, pcb_idx, page);
     if (is_write) frame_table[target_frame].dirty = 1;
 
-    /* Block the process until disk I/O finishes */
+    // Block the process until disk I/O finishes
     int ub_nano = *nano + DISK_IO_NS + extra_ns;
     int ub_sec  = *sec;
     while (ub_nano >= BILLION) { ub_sec++; ub_nano -= BILLION; }
@@ -250,67 +263,122 @@ static int handle_memory_request(int pcb_idx, int address, int is_write,
     return 1;
 }
 
-/* -----------------------------------------------------------------------
- * main
- * ----------------------------------------------------------------------- */
+// Main
+
 int main(int argc, char *argv[]) {
     srand(time(NULL));
     int opt;
     int    n     = -1, s = -1;
     double t     = -1, i_val = -1;
 
+    // Parse command line arguments
     while ((opt = getopt(argc, argv, "hn:s:t:i:f:")) != -1) {
         switch (opt) {
-        case 'h':
-            printf("Usage: %s [-h] [-n proc] [-s simul] [-t timeLimitForChildren]"
-                   " [-i intervalInSecondsToLaunchChildren] [-f logfile]\n", argv[0]);
-            return 0;
-        case 'n': n     = atoi(optarg); break;
-        case 's': s     = atoi(optarg); break;
-        case 't': t     = atof(optarg); break;
-        case 'i': i_val = atof(optarg); break;
-        case 'f':
-            log_file = fopen(optarg, "w");
-            if (!log_file) { perror("OSS: fopen log"); return 1; }
-            break;
-        default:
-            fprintf(stderr, "Usage: %s [-h] [-n proc] [-s simul] [-t timeLimitForChildren]"
-                    " [-i intervalInSecondsToLaunchChildren] [-f logfile]\n", argv[0]);
-            return 1;
+            case 'h':
+                printf("Usage: %s [-h] [-n proc] [-s simul] [-t timelimitForChildren] [-i intervalInSecondsToLaunchChildren] [-f logfile]\n", argv[0]);
+                printf("  -h Display help message and exit\n");
+                printf("  -n proc   Total number of child processes to launch\n");
+                printf("  -s simul  Maximum number of children running simultaneously\n");
+				printf("  -t iter   Upper bound of simulated time each child runs\n");
+                printf("  -i sec    Interval in simulated seconds to launch new children\n");
+                printf("  -f file   Log output to specified file\n");
+                return 0;
+            case 'n':
+                n = atoi(optarg);
+                break;
+            case 's':
+                s = atoi(optarg);
+                break;
+            case 't':
+                t = atof(optarg);
+                break;
+            case 'i':
+                i_val = atof(optarg);
+                break;
+            case 'f':
+                // log file
+                log_file = fopen(optarg, "w");
+                if (!log_file) {
+                    perror("OSS: Failed to open log file");
+                    return 1;
+                }
+                break;
+            default:
+                printf("Usage: %s [-h] [-n proc] [-s simul] [-t timelimitForChildren] [-i intervalInSecondsToLaunchChildren] [-f logfile]\n", argv[0]);
+                printf("  -h Display help message and exit\n");
+                printf("  -n proc   Total number of child processes to launch\n");
+				printf("  -s simul  Maximum number of children running simultaneously\n");
+				printf("  -t iter   Upper bound of simulated time each child runs\n");
+                printf("  -i sec    Interval in simulated seconds to launch new children\n");
+                printf("  -f file   Log output to specified file\n");
+                return 1;
         }
     }
 
     if (n <= 0 || s <= 0 || t <= 0 || i_val < 0) {
-        fprintf(stderr, "OSS: Missing or invalid required arguments\n");
+        fprintf(stderr, "Missing or invalid required arguments\n");
+        printf("Usage: %s [-h] [-n proc] [-s simul] [-t timelimitForChildren] [-i intervalInSecondsToLaunchChildren]\n", argv[0]);
+        printf("-n value must be greater then 0. \n");
+        printf("-s value must be greater then 0. \n");
+        printf("-t value must be greater then 0. \n");
+        printf("-i value must be greater or equal to 0. \n");
         return 1;
     }
 
     signal(SIGINT,  cleanup);
     signal(SIGALRM, cleanup);
-    alarm(60); /* 60 real-time second safety net */
+    alarm(60); // 60 real-time second safety net
 
-    /* -- Shared memory (simulated clock: two ints) ---------------- */
-    int shm_key = ftok("oss.c", 'R');
-    if (shm_key <= 0) { fprintf(stderr, "OSS: ftok shm failed\n"); return 1; }
-    shm_id = shmget(shm_key, sizeof(int) * 2, PERMS | IPC_CREAT);
-    if (shm_id <= 0) { fprintf(stderr, "OSS: shmget failed\n"); return 1; }
-    clockptr = (int *)shmat(shm_id, NULL, 0);
-    if (clockptr == (void *)-1) { fprintf(stderr, "OSS: shmat failed\n"); return 1; }
-    int *sec  = &clockptr[0];
+    // Create shared memory
+    int shm_key = ftok("oss.c", 'R'); // Generate a unique key for shared memory
+    if (shm_key <= 0) {
+        fprintf(stderr, "OSS: Failed to generate shared memory key (ftok failed)\n");
+        return 1;
+    }
+
+    // Create shared memory segment
+    shm_id = shmget(shm_key, sizeof(int) * 2, PERMS | IPC_CREAT); 
+    if (shm_id <= 0) {
+        fprintf(stderr, "OSS: Failed to create shared memory segment (shmget failed)\n");
+        return 1;
+    }
+
+    // Attach to shared memory
+    clockptr = (int *)shmat(shm_id, NULL, 0); 
+    if (clockptr == (void *) -1) {
+        fprintf(stderr, "OSS: Failed to attach to shared memory (shmat failed)\n");
+        return 1;
+    }
+
+    // Initialize shared clock
+    int *sec = &clockptr[0];
     int *nano = &clockptr[1];
     *sec = 0; *nano = 0;
 
-    /* -- Message queue -------------------------------------------- */
+    // Create a file for ftok to use for message queue key generation
     FILE *tmp = fopen("msgq.txt", "w");
-    if (!tmp) { perror("OSS: fopen msgq.txt"); exit(1); }
+    if (tmp == NULL) {
+        perror("OSS: fopen msgq.txt");
+        exit(1);
+    }
     fclose(tmp);
-    key_t msg_key = ftok("msgq.txt", 1);
-    if (msg_key == -1) { perror("OSS: ftok msgq"); exit(1); }
-    if ((msqid = msgget(msg_key, PERMS | IPC_CREAT)) == -1) {
-        perror("OSS: msgget"); exit(1);
+
+    // Get a key for our message queue
+    key_t msg_key;
+    if ((msg_key = ftok("msgq.txt", 1)) == -1) {
+        perror("OSS: ftok");
+        exit(1);
     }
 
-    /* -- Initialize tables ---------------------------------------- */
+    // Create message queue
+    if ((msqid = msgget(msg_key, PERMS | IPC_CREAT)) == -1) {
+        perror("OSS: msgget in parent");
+        exit(1);
+    }
+
+    log_msg("OSS: Message queue created with ID: %d\n", msqid);
+
+    // Initialize tables
     for (int j = 0; j < NUM_FRAMES; j++) {
         frame_table[j] = (FrameEntry){ .occupied = 0, .dirty = 0,
                                        .process  = -1, .page = -1 };
@@ -320,8 +388,9 @@ int main(int argc, char *argv[]) {
         for (int p = 0; p < NUM_PAGES; p++)
             table[j].page_table[p] = -1;
 
-    log_msg("OSS: Starting, PID:%d\n", getpid());
-    log_msg("OSS: -n %d -s %d -t %.3f -i %.3f\n\n", n, s, t, i_val);
+    // Print initial configuration
+    log_msg("OSS: OSS starting, PID:%d PPID:%d\n", getpid(), getppid());
+    log_msg("OSS: Called with:\n-n %d\n-s %d\n-t %.3f\n-i %.3f\n\n", n, s, t, i_val);
 
     int running        = 0;
     int total_launched = 0;
@@ -332,12 +401,14 @@ int main(int argc, char *argv[]) {
 
     while (total_launched < n || running > 0) {
 
-        /* -- 1. Advance simulated clock by 10 ms ------------------- */
+        // 1. Advance simulated clock by 10 ms
         advance_clock(sec, nano, 10000000);
 
-        /* -- 2. Soft-deadlock prevention: if every running process
-                is blocked, jump the clock to the earliest unblock
-                time so the simulation doesn't spin forever.          */
+        /* 
+        2. Soft-deadlock prevention: if every running process
+        is blocked, jump the clock to the earliest unblock
+        time so the simulation doesn't spin forever.
+        */
         if (running > 0) {
             bool all_blocked = true;
             bool found_blocked = false;
@@ -365,7 +436,7 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        /* -- 3. Unblock processes whose I/O wait has elapsed -------- */
+        // 3. Unblock processes whose I/O wait has elapsed
         for (int j = 0; j < MAX_PCB; j++) {
             if (!table[j].occupied || !table[j].blocked) continue;
             if (*sec > table[j].unblock_sec ||
@@ -382,7 +453,7 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        /* -- 4. Launch a new worker if conditions are met ----------- */
+        // 4. Launch a new worker if conditions are met
         {
             int diff_sec  = *sec  - last_launch_sec;
             int diff_nano = *nano - last_launch_nano;
@@ -439,7 +510,7 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        /* -- 5. Round-robin: pick the next unblocked process ------- */
+        // 5. Round-robin: pick the next unblocked process
         int found = -1;
         for (int k = 0; k < MAX_PCB; k++) {
             current = (current + 1) % MAX_PCB;
@@ -450,20 +521,36 @@ int main(int argc, char *argv[]) {
         }
 
         if (found != -1) {
-            advance_clock(sec, nano, 100); /* small tick before sending */
+            advance_clock(sec, nano, 100); // small tick before sending
 
-            /* Send turn token */
+            // Send turn token
             msg.mtype   = table[found].pid;
             msg.intData = 1;
             msgsnd(msqid, &msg, sizeof(msgbuffer) - sizeof(long), 0);
 
-            /* Receive response */
+            // Receive response
             if (msgrcv(msqid, &msg, sizeof(msgbuffer) - sizeof(long), 1, 0) != -1) {
 
                 if (msg.intData == 0) {
-                    /* Process terminating */
+                    // Process terminating
                     log_msg("OSS: P%d terminating at time %d:%09d\n",
                             found, *sec, *nano);
+
+                    // Compute effective memory access time (EMAT):
+                    // elapsed simulated nanoseconds / total memory accesses
+                    long long elapsed_ns =
+                        (long long)(*sec  - table[found].start_sec)  * BILLION +
+                        (long long)(*nano - table[found].start_nanosec);
+                    if (table[found].total_accesses > 0) {
+                        long long emat = elapsed_ns / table[found].total_accesses;
+                        log_msg("OSS: P%d effective memory access time: %lld ns"
+                                " (%d accesses over %lld ns)\n",
+                                found, emat,
+                                table[found].total_accesses, elapsed_ns);
+                    } else {
+                        log_msg("OSS: P%d made no memory accesses\n", found);
+                    }
+
                     free_process_frames(found);
                     waitpid(table[found].pid, NULL, 0);
                     memset(&table[found], 0, sizeof(struct PCB));
@@ -472,7 +559,7 @@ int main(int argc, char *argv[]) {
                     running--;
 
                 } else {
-                    /* Memory request: decode address and direction */
+                    // Memory request: decode address and direction
                     int raw      = msg.intData;
                     int is_write = (raw < 0);
                     int address  = (is_write ? -raw : raw) - 1;
@@ -486,12 +573,13 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        /* -- 6. Print memory map + blocked list every 0.5 sim seconds */
+        // 6. Print memory map + blocked list every 0.5 sim seconds
         if (*sec > last_print_sec ||
             (*sec == last_print_sec && *nano >= last_print_nano + 500000000)) {
             last_print_sec  = *sec;
             last_print_nano = *nano;
 
+            print_pcb_table();
             print_memory_map(*sec, *nano);
 
             log_msg("OSS: Blocked processes: ");
@@ -507,7 +595,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* -- Final statistics -------------------------------------------- */
+    // Final statistics
     int total_accesses = total_reads + total_writes;
     log_msg("\nOSS: Final Report:\n");
     log_msg("  Total reads:       %d\n", total_reads);
